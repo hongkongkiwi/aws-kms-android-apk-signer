@@ -1,0 +1,171 @@
+#!/bin/bash
+
+# This script verifies an APK signature against a specified AWS KMS key ID.
+# It performs the following steps:
+# 1. Exports the public key from AWS KMS.
+# 2. Verifies the APK signature using the exported public key.
+
+# Required IAM Permissions:
+# The IAM user or role needs the following permissions:
+# - kms:GetPublicKey
+
+# Example IAM policy:
+# {
+#   "Version": "2012-10-17",
+#   "Statement": [
+#     {
+#       "Effect": "Allow",
+#       "Action": [
+#         "kms:GetPublicKey"
+#       ],
+#       "Resource": "arn:aws:kms:YOUR_REGION:YOUR_ACCOUNT_ID:key/YOUR_KEY_ID"
+#     }
+#   ]
+# }
+
+# Default paths for tools (can be overridden by environment variables)
+APKSIGNER_PATH="${APKSIGNER_PATH:-apksigner}"
+KEYTOOL_PATH="${KEYTOOL_PATH:-keytool}"
+OPENSSL_PATH="${OPENSSL_PATH:-openssl}"
+
+# Function to check if a command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Check prerequisites
+for cmd in aws jq; do
+    if ! command_exists "$cmd"; then
+        echo "Error: $cmd is not installed."
+        case $cmd in
+            aws)
+                echo "Install AWS CLI:"
+                echo "  Ubuntu/Debian: sudo apt install awscli"
+                echo "  macOS: brew install awscli"
+                ;;
+            jq)
+                echo "Install jq:"
+                echo "  Ubuntu/Debian: sudo apt install jq"
+                echo "  macOS: brew install jq"
+                ;;
+        esac
+        exit 1
+    fi
+done
+
+# Check if specified paths for tools are valid
+for cmd in "$APKSIGNER_PATH" "$KEYTOOL_PATH" "$OPENSSL_PATH"; do
+    if ! command_exists "$cmd"; then
+        echo "Error: $cmd is not installed or not found at the specified path. Please set the appropriate environment variable (e.g., APKSIGNER_PATH, KEYTOOL_PATH, OPENSSL_PATH) to the correct path or install the tool."
+        case $cmd in
+            "$APKSIGNER_PATH")
+                echo "To install apksigner, install the Android SDK Build-Tools."
+                ;;
+            "$KEYTOOL_PATH")
+                echo "To install keytool, install the JDK."
+                echo "  Ubuntu/Debian: sudo apt install default-jdk"
+                echo "  macOS: brew install openjdk"
+                ;;
+            "$OPENSSL_PATH")
+                echo "To install openssl:"
+                echo "  Ubuntu/Debian: sudo apt install openssl"
+                echo "  macOS: brew install openssl"
+                ;;
+        esac
+        exit 1
+    fi
+done
+
+# Function to print usage
+usage() {
+    cat <<EOF
+Usage: $0 -k <aws-kms-key-id> -i <input-apk>
+  -k, --kms-key-id          AWS KMS Key ID (can be Key ID, Key ARN, Alias name, or Alias ARN)
+  -i, --input-apk           Path to the APK to be verified
+  -h, --help                Display this help message
+
+Examples:
+  $0 -k "1234abcd-12ab-34cd-56ef-1234567890ab" -i "path/to/your-app.apk"
+  $0 -k "arn:aws:kms:us-west-2:123456789012:key/abcd1234-abcd-1234-abcd-1234567890ab" -i "path/to/your-app.apk"
+  $0 -k "alias/my-key-alias" -i "path/to/your-app.apk"
+  $0 -k "arn:aws:kms:us-west-2:123456789012:alias/my-key-alias" -i "path/to/your-app.apk"
+EOF
+    exit 1
+}
+
+# Function to parse arguments
+parse_args() {
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            -k|--kms-key-id)
+                if [[ "$1" == *=* ]]; then
+                    AWS_KEY_ID="${1#*=}"
+                else
+                    AWS_KEY_ID="$2"
+                    shift
+                fi
+                shift
+                ;;
+            -i|--input-apk)
+                if [[ "$1" == *=* ]]; then
+                    INPUT_APK="${1#*=}"
+                else
+                    INPUT_APK="$2"
+                    shift
+                fi
+                shift
+                ;;
+            -h|--help)
+                usage
+                ;;
+            *)
+                echo "Unknown parameter passed: $1"
+                usage
+                ;;
+        esac
+    done
+}
+
+# Parse arguments
+parse_args "$@"
+
+# Check if all required arguments are provided
+if [ -z "$AWS_KEY_ID" ] || [ -z "$INPUT_APK" ]; then
+    usage
+fi
+
+# Create a temporary directory for temporary files
+TEMP_DIR=$(mktemp -d) || { echo "Error: Failed to create temporary directory."; exit 1; }
+trap 'rm -rf "$TEMP_DIR"' EXIT
+
+# Set other necessary variables
+PUBLIC_KEY_PEM="$TEMP_DIR/public-key.pem"
+
+# Step 1: Export the public key from AWS KMS and detect key type
+echo "Exporting public key from AWS KMS..."
+PUBLIC_KEY_INFO=$(aws kms get-public-key --key-id "$AWS_KEY_ID" --output json) || { echo "Error: Failed to export public key."; exit 1; }
+
+KEY_USAGE=$(echo "$PUBLIC_KEY_INFO" | jq -r '.KeyUsage')
+if [ "$KEY_USAGE" != "SIGN_VERIFY" ]; then
+    echo "Error: KMS key is not for signing."
+    exit 1
+fi
+
+KEY_SPEC=$(echo "$PUBLIC_KEY_INFO" | jq -r '.KeySpec')
+PUBLIC_KEY=$(echo "$PUBLIC_KEY_INFO" | jq -r '.PublicKey' | base64 -d)
+
+# Convert the public key to PEM format based on the key specification
+if [ "$KEY_SPEC" == "RSA_2048" ] || [ "$KEY_SPEC" == "RSA_3072" ] || [ "$KEY_SPEC" == "RSA_4096" ]; then
+    echo "$PUBLIC_KEY" | "$OPENSSL_PATH" rsa -pubin -inform DER -outform PEM -out "$PUBLIC_KEY_PEM" || { echo "Error: Failed to convert RSA public key."; exit 1; }
+elif [ "$KEY_SPEC" == "ECC_NIST_P256" ] || [ "$KEY_SPEC" == "ECC_NIST_P384" ] || [ "$KEY_SPEC" == "ECC_NIST_P521" ]; then
+    echo "$PUBLIC_KEY" | "$OPENSSL_PATH" ec -pubin -inform DER -outform PEM -out "$PUBLIC_KEY_PEM" || { echo "Error: Failed to convert ECC public key."; exit 1; }
+else
+    echo "Unsupported key type: $KEY_SPEC"
+    exit 1
+fi
+
+# Step 2: Verify the APK using the public key
+echo "Verifying the APK using the public key..."
+"$APKSIGNER_PATH" verify --print-certs --verbose --cert "$PUBLIC_KEY_PEM" "$INPUT_APK" || { echo "Error: APK verification failed."; exit 1; }
+
+echo "APK verification successful."

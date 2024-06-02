@@ -1,0 +1,271 @@
+#!/bin/bash
+
+# This script automates the process of signing an APK using apksigner and AWS KMS.
+# It performs the following steps:
+# 1. Exports a public key from AWS KMS.
+# 2. Creates a temporary keystore with the public key.
+# 3. Signs the APK with the temporary keystore.
+# 4. Extracts the digest of the APK signature.
+# 5. Signs the digest with AWS KMS.
+# 6. Verifies the final APK signature.
+# 7. Displays information about the signed APK.
+
+# Required IAM Permissions:
+# The IAM user or role needs the following permissions:
+# - kms:GetPublicKey
+# - kms:Sign
+
+# Example IAM policy:
+# {
+#   "Version": "2012-10-17",
+#   "Statement": [
+#     {
+#       "Effect": "Allow",
+#       "Action": [
+#         "kms:GetPublicKey",
+#         "kms:Sign"
+#       ],
+#       "Resource": "arn:aws:kms:YOUR_REGION:YOUR_ACCOUNT_ID:key/YOUR_KEY_ID"
+#     }
+#   ]
+# }
+
+# Default paths for tools (can be overridden by environment variables)
+APKSIGNER_PATH="${APKSIGNER_PATH:-apksigner}"
+KEYTOOL_PATH="${KEYTOOL_PATH:-keytool}"
+OPENSSL_PATH="${OPENSSL_PATH:-openssl}"
+
+# Function to check if a command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Check prerequisites
+for cmd in aws jq xxd; do
+    if ! command_exists "$cmd"; then
+        echo "Error: $cmd is not installed."
+        case $cmd in
+            aws)
+                echo "Install AWS CLI:"
+                echo "  Ubuntu/Debian: sudo apt install awscli"
+                echo "  macOS: brew install awscli"
+                ;;
+            jq)
+                echo "Install jq:"
+                echo "  Ubuntu/Debian: sudo apt install jq"
+                echo "  macOS: brew install jq"
+                ;;
+            xxd)
+                echo "Install xxd:"
+                echo "  Ubuntu/Debian: sudo apt install xxd"
+                echo "  macOS: brew install xxd"
+                ;;
+        esac
+        exit 1
+    fi
+done
+
+# Check if specified paths for tools are valid
+for cmd in "$APKSIGNER_PATH" "$KEYTOOL_PATH" "$OPENSSL_PATH"; do
+    if ! command_exists "$cmd"; then
+        echo "Error: $cmd is not installed or not found at the specified path. Please set the appropriate environment variable (e.g., APKSIGNER_PATH, KEYTOOL_PATH, OPENSSL_PATH) to the correct path or install the tool."
+        case $cmd in
+            "$APKSIGNER_PATH")
+                echo "To install apksigner, install the Android SDK Build-Tools."
+                ;;
+            "$KEYTOOL_PATH")
+                echo "To install keytool, install the JDK."
+                echo "  Ubuntu/Debian: sudo apt install default-jdk"
+                echo "  macOS: brew install openjdk"
+                ;;
+            "$OPENSSL_PATH")
+                echo "To install openssl:"
+                echo "  Ubuntu/Debian: sudo apt install openssl"
+                echo "  macOS: brew install openssl"
+                ;;
+        esac
+        exit 1
+    fi
+done
+
+# Function to print usage
+usage() {
+    cat <<EOF
+Usage: $0 -k <aws-kms-key-id> -i <input-apk> -o <output-signed-apk> [-v1] [-v2] [-v3]
+  -k, --kms-key-id          AWS KMS Key ID (can be Key ID, Key ARN, Alias name, or Alias ARN)
+  -i, --input-apk           Path to the APK to be signed
+  -o, --output-apk          Output path for the signed APK
+  -v1, --v1-signing         Enable APK Signature Scheme v1
+  -v2, --v2-signing         Enable APK Signature Scheme v2
+  -v3, --v3-signing         Enable APK Signature Scheme v3 (default)
+  -h, --help                Display this help message
+
+Examples:
+  $0 -k "1234abcd-12ab-34cd-56ef-1234567890ab" -i "path/to/your-app.apk" -o "signed-app.apk" -v1 -v2 -v3
+  $0 -k "arn:aws:kms:us-west-2:123456789012:key/abcd1234-abcd-1234-abcd-1234567890ab" -i "path/to/your-app.apk" -o "signed-app.apk" -v1 -v2
+  $0 -k "alias/my-key-alias" -i "path/to/your-app.apk" -o "signed-app.apk" -v1 -v3
+  $0 -k "arn:aws:kms:us-west-2:123456789012:alias/my-key-alias" -i "path/to/your-app.apk" -o "signed-app.apk" -v2
+EOF
+    exit 1
+}
+
+# Function to parse arguments
+parse_args() {
+    ENABLE_V1=false
+    ENABLE_V2=false
+    ENABLE_V3=false
+
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            -k|--kms-key-id)
+                if [[ "$1" == *=* ]]; then
+                    AWS_KEY_ID="${1#*=}"
+                else
+                    AWS_KEY_ID="$2"
+                    shift
+                fi
+                shift
+                ;;
+            -i|--input-apk)
+                if [[ "$1" == *=* ]]; then
+                    INPUT_APK="${1#*=}"
+                else
+                    INPUT_APK="$2"
+                    shift
+                fi
+                shift
+                ;;
+            -o|--output-apk)
+                if [[ "$1" == *=* ]]; then
+                    SIGNED_APK="${1#*=}"
+                else
+                    SIGNED_APK="$2"
+                    shift
+                fi
+                shift
+                ;;
+            -v1|--v1-signing)
+                ENABLE_V1=true
+                shift
+                ;;
+            -v2|--v2-signing)
+                ENABLE_V2=true
+                shift
+                ;;
+            -v3|--v3-signing)
+                ENABLE_V3=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                ;;
+            *)
+                echo "Unknown parameter passed: $1"
+                usage
+                ;;
+        esac
+    done
+
+    # Default to v3 signing if no signing scheme is specified
+    if ! $ENABLE_V1 && ! $ENABLE_V2 && ! $ENABLE_V3; then
+        ENABLE_V3=true
+    fi
+}
+
+# Function to clean up temporary files
+cleanup() {
+    rm -rf "$TEMP_DIR"
+}
+
+# Trap to clean up temporary files on script exit
+trap cleanup EXIT
+
+# Parse arguments
+parse_args "$@"
+
+# Check if all required arguments are provided
+if [ -z "$AWS_KEY_ID" ] || [ -z "$INPUT_APK" ] || [ -z "$SIGNED_APK" ]; then
+    usage
+fi
+
+# Create a temporary directory for temporary files
+TEMP_DIR=$(mktemp -d) || { echo "Error: Failed to create temporary directory."; exit 1; }
+
+# Generate a random password for the temporary keystore
+TEMP_KEYSTORE_PASS=$(openssl rand -base64 32) || { echo "Error: Failed to generate random password."; exit 1; }
+
+# Set other necessary variables
+TEMP_KEYSTORE="$TEMP_DIR/temp-keystore.jks"
+TEMP_KEY_ALIAS="temp-key"
+TEMP_SIGNED_APK="$TEMP_DIR/temp-signed.apk"
+PUBLIC_KEY_PEM="$TEMP_DIR/public-key.pem"
+DIGEST_FILE="$TEMP_DIR/digest.sha256"
+SIGNATURE_FILE="$TEMP_DIR/signature.bin"
+
+# Ensure necessary files don't already exist to avoid conflicts
+if [ -e "$SIGNED_APK" ]; then
+    echo "Error: File $SIGNED_APK already exists. Please remove it or choose a different name."
+    exit 1
+fi
+
+# Step 1: Export the public key from AWS KMS and detect key type
+echo "Exporting public key from AWS KMS..."
+PUBLIC_KEY_INFO=$(aws kms get-public-key --key-id "$AWS_KEY_ID" --output json) || { echo "Error: Failed to export public key."; exit 1; }
+
+KEY_USAGE=$(echo "$PUBLIC_KEY_INFO" | jq -r '.KeyUsage')
+if [ "$KEY_USAGE" != "SIGN_VERIFY" ]; then
+    echo "Error: KMS key is not for signing."
+    exit 1
+fi
+
+KEY_SPEC=$(echo "$PUBLIC_KEY_INFO" | jq -r '.KeySpec')
+PUBLIC_KEY=$(echo "$PUBLIC_KEY_INFO" | jq -r '.PublicKey' | base64 -d)
+
+# Convert the public key to PEM format based on the key specification
+if [ "$KEY_SPEC" == "RSA_2048" ] || [ "$KEY_SPEC" == "RSA_3072" ] || [ "$KEY_SPEC" == "RSA_4096" ]; then
+    echo "$PUBLIC_KEY" | "$OPENSSL_PATH" rsa -pubin -inform DER -outform PEM -out "$PUBLIC_KEY_PEM" || { echo "Error: Failed to convert RSA public key."; exit 1; }
+elif [ "$KEY_SPEC" == "ECC_NIST_P256" ] || [ "$KEY_SPEC" == "ECC_NIST_P384" ] || [ "$KEY_SPEC" == "ECC_NIST_P521" ]; then
+    echo "$PUBLIC_KEY" | "$OPENSSL_PATH" ec -pubin -inform DER -outform PEM -out "$PUBLIC_KEY_PEM" || { echo "Error: Failed to convert ECC public key."; exit 1; }
+else
+    echo "Unsupported key type: $KEY_SPEC"
+    exit 1
+fi
+
+# Step 2: Create a temporary keystore with the public key
+echo "Creating temporary keystore with the public key..."
+"$KEYTOOL_PATH" -genkeypair -v -keystore "$TEMP_KEYSTORE" -keyalg RSA -keysize 2048 -validity 10000 -alias "$TEMP_KEY_ALIAS" -dname "CN=temp, OU=development, O=company, L=city, ST=state, C=country" -storepass "$TEMP_KEYSTORE_PASS" -keypass "$TEMP_KEYSTORE_PASS" || { echo "Error: Failed to generate temporary keystore and key pair."; exit 1; }
+
+# Import the public key into the keystore
+"$KEYTOOL_PATH" -importcert -alias "$TEMP_KEY_ALIAS" -file "$PUBLIC_KEY_PEM" -keystore "$TEMP_KEYSTORE" -storepass "$TEMP_KEYSTORE_PASS" -noprompt || { echo "Error: Failed to import public key into keystore."; exit 1; }
+
+# Step 3: Sign the APK with the temporary keystore
+echo "Signing the APK with the temporary keystore..."
+"$APKSIGNER_PATH" sign --ks "$TEMP_KEYSTORE" --ks-key-alias "$TEMP_KEY_ALIAS" --ks-pass pass:"$TEMP_KEYSTORE_PASS" --key-pass pass:"$TEMP_KEYSTORE_PASS" --out "$TEMP_SIGNED_APK" "$INPUT_APK" || { echo "Error: Failed to sign APK."; exit 1; }
+
+# Step 4: Extract the digest of the APK signature
+echo "Extracting the digest of the APK signature..."
+DIGEST=$("$APKSIGNER_PATH" verify --verbose "$TEMP_SIGNED_APK" | grep "SHA-256 digest:" | awk '{print $4}') || { echo "Error: Failed to extract digest."; exit 1; }
+if [ -z "$DIGEST" ]; then
+    echo "Error: Digest is empty."
+    exit 1
+fi
+echo "$DIGEST" | xxd -r -p > "$DIGEST_FILE" || { echo "Error: Failed to write digest to file."; exit 1; }
+
+# Step 5: Sign the digest with AWS KMS
+echo "Signing the digest with AWS KMS..."
+# This line uses the AWS KMS sign operation to sign the digest of the APK using the specified KMS key
+aws kms sign --key-id "$AWS_KEY_ID" --message-type RAW --signing-algorithm "$SIGN_ALGORITHM" --message fileb://"$DIGEST_FILE" --output text --query Signature | base64 -d > "$SIGNATURE_FILE" || { echo "Error: Failed to sign digest with AWS KMS."; exit 1; }
+
+# Step 6: Replace the temporary signature with the AWS KMS signature
+echo "Replacing the temporary signature with the AWS KMS signature..."
+"$APKSIGNER_PATH" sign --ks "$TEMP_KEYSTORE" --ks-key-alias "$TEMP_KEY_ALIAS" --ks-pass pass:"$TEMP_KEYSTORE_PASS" --key-pass pass:"$TEMP_KEYSTORE_PASS" --out "$SIGNED_APK" --v1-signing-enabled $ENABLE_V1 --v2-signing-enabled $ENABLE_V2 --v3-signing-enabled $ENABLE_V3 --in "$TEMP_SIGNED_APK" --ks-type PKCS12 --ks "$SIGNATURE_FILE" || { echo "Error: Failed to replace temporary signature."; exit 1; }
+
+# Step 7: Verify the final APK signature
+echo "Verifying the final APK signature..."
+"$APKSIGNER_PATH" verify --verbose "$SIGNED_APK" || { echo "Error: Failed to verify the final APK signature."; exit 1; }
+
+# Step 8: Display information about the signed APK
+echo "Displaying information about the signed APK..."
+"$APKSIGNER_PATH" verify --print-certs "$SIGNED_APK" || { echo "Error: Failed to display signed APK information."; exit 1; }
+
+echo "APK has been signed and verified successfully. Output: $SIGNED_APK"
